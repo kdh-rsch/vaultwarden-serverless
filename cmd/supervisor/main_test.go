@@ -112,6 +112,10 @@ func TestLoadConfig_StrictHost(t *testing.T) {
 		t.Errorf("expected StrictHost=false by default, got true")
 	}
 
+	if cfgDefault.DomainPath != "" {
+		t.Errorf("expected empty DomainPath by default, got %q", cfgDefault.DomainPath)
+	}
+
 	// 2. ALLOWED_HOSTS enables strict host
 	t.Setenv("ALLOWED_HOSTS", "vault1.example.com, VAULT2.EXAMPLE.COM ")
 	cfgHosts, err := loadConfig()
@@ -125,10 +129,10 @@ func TestLoadConfig_StrictHost(t *testing.T) {
 		t.Errorf("expected [vault1.example.com, vault2.example.com], got %v", cfgHosts.AllowedHosts)
 	}
 
-	// 3. STRICT_HOST=true with DOMAIN parses domain hostname
+	// 3. STRICT_HOST=true with DOMAIN parses domain hostname and subpath
 	t.Setenv("ALLOWED_HOSTS", "")
 	t.Setenv("STRICT_HOST", "true")
-	t.Setenv("DOMAIN", "https://vault.mycorp.org:8443/secret-vault")
+	t.Setenv("DOMAIN", "https://vault.mycorp.org:8443/secret-vault/")
 	cfgDomain, err := loadConfig()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -138,6 +142,9 @@ func TestLoadConfig_StrictHost(t *testing.T) {
 	}
 	if len(cfgDomain.AllowedHosts) != 1 || cfgDomain.AllowedHosts[0] != "vault.mycorp.org" {
 		t.Errorf("expected [vault.mycorp.org], got %v", cfgDomain.AllowedHosts)
+	}
+	if cfgDomain.DomainPath != "/secret-vault" {
+		t.Errorf("expected DomainPath '/secret-vault', got %q", cfgDomain.DomainPath)
 	}
 }
 

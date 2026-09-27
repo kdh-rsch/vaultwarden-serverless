@@ -44,6 +44,7 @@ type Config struct {
 	StartupTimeout         time.Duration
 	AllowedHosts           []string
 	StrictHost             bool
+	DomainPath             string
 	PublicPort             string
 	InternalPort           string
 	ProjectID              string
@@ -129,23 +130,28 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
-	// If STRICT_HOST is true or ALLOWED_HOSTS was provided, and DOMAIN is set, add DOMAIN host
-	if (strictHost || len(allowedHosts) > 0) && domainStr != "" {
+	var domainPath string
+	if domainStr != "" {
 		dHost := domainStr
 		if !strings.Contains(dHost, "://") {
 			dHost = "https://" + dHost
 		}
-		if u, err := url.Parse(dHost); err == nil && u.Hostname() != "" {
-			h := strings.ToLower(u.Hostname())
-			exists := false
-			for _, ah := range allowedHosts {
-				if ah == h {
-					exists = true
-					break
-				}
+		if u, err := url.Parse(dHost); err == nil {
+			if u.Path != "" && u.Path != "/" {
+				domainPath = strings.TrimRight(u.Path, "/")
 			}
-			if !exists {
-				allowedHosts = append(allowedHosts, h)
+			if (strictHost || len(allowedHosts) > 0) && u.Hostname() != "" {
+				h := strings.ToLower(u.Hostname())
+				exists := false
+				for _, ah := range allowedHosts {
+					if ah == h {
+						exists = true
+						break
+					}
+				}
+				if !exists {
+					allowedHosts = append(allowedHosts, h)
+				}
 			}
 		}
 	}
@@ -172,6 +178,7 @@ func loadConfig() (*Config, error) {
 		StartupTimeout:         startupTimeout,
 		AllowedHosts:           allowedHosts,
 		StrictHost:             strictHost && len(allowedHosts) > 0,
+		DomainPath:             domainPath,
 		PublicPort:             getEnvOrDefault("PORT", "8080"),
 		InternalPort:           getEnvOrDefault("INTERNAL_PORT", "8081"),
 		ProjectID: func() string {
@@ -619,8 +626,9 @@ func runDualProcess(ctx context.Context, cfg *Config, proxy *ReverseProxyServer)
 		vwDone <- vwCmd.Wait()
 	}()
 
-	// Wait for Vaultwarden's internal /alive probe
-	aliveURL := fmt.Sprintf("http://127.0.0.1:%s/alive", cfg.InternalPort)
+	// Wait for Vaultwarden's internal /alive probe (accounting for DOMAIN subpath if set)
+	probePath := path.Join("/", cfg.DomainPath, "alive")
+	aliveURL := fmt.Sprintf("http://127.0.0.1:%s%s", cfg.InternalPort, probePath)
 	if err := waitForBackendAlive(aliveURL, vwDone, 10*time.Second); err != nil {
 		slog.Error("Vaultwarden failed to become ready", "component", "supervisor", "error", err)
 		_ = vwCmd.Process.Kill()
