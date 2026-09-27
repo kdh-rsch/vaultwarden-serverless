@@ -24,6 +24,7 @@ type ProxyConfig struct {
 	StartupTimeout time.Duration // Timeout for buffering client requests during boot
 	AllowedHosts   []string      // Allowed Host header values (case-insensitive)
 	StrictHost     bool          // Whether to enforce AllowedHosts validation
+	DomainPath     string        // URL subpath prefix (e.g. "/nxp42")
 	AuthTokens     []string      // Allowed secret tokens for administrative endpoints (e.g. /_supervisor/taint)
 }
 
@@ -85,6 +86,7 @@ type ReverseProxyServer struct {
 	startupTimeout time.Duration
 	allowedHosts   []string
 	strictHost     bool
+	domainPath     string
 	authTokens     []string
 }
 
@@ -121,6 +123,7 @@ func NewReverseProxyServer(cfg ProxyConfig) (*ReverseProxyServer, error) {
 		startupTimeout: startupTimeout,
 		allowedHosts:   allowedHosts,
 		strictHost:     cfg.StrictHost && len(allowedHosts) > 0,
+		domainPath:     strings.TrimRight(cfg.DomainPath, "/"),
 		authTokens:     authTokens,
 	}
 
@@ -265,7 +268,19 @@ func (ps *ReverseProxyServer) Shutdown(ctx context.Context) error {
 // ServeHTTP routes incoming traffic to health checks or the reverse proxy.
 func (ps *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 1. Supervisor Administrative and Health Check endpoints
-	switch r.URL.Path {
+	// Support both root paths (/ready, /healthz, /alive) and custom subpath prefixes (/nxp42/ready, etc.)
+	probePath := r.URL.Path
+	if ps.domainPath != "" && strings.HasPrefix(probePath, ps.domainPath) {
+		trimmed := strings.TrimPrefix(probePath, ps.domainPath)
+		if trimmed == "" || strings.HasPrefix(trimmed, "/") {
+			probePath = trimmed
+			if !strings.HasPrefix(probePath, "/") {
+				probePath = "/" + probePath
+			}
+		}
+	}
+
+	switch probePath {
 	case "/healthz", "/alive":
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -350,12 +365,24 @@ func (ps *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 				"path", r.URL.Path,
 				"client_ip", ExtractClientIP(r),
 			)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusForbidden)
-			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error":   "forbidden",
-				"message": "Host header is not allowed",
-			})
+			// Stealth rejection: 404 Not Found without response body
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}
+
+	// 2.5. Custom Path Prefix Validation: If domainPath is configured, reject requests outside the prefix
+	if ps.domainPath != "" {
+		if r.URL.Path != ps.domainPath && !strings.HasPrefix(r.URL.Path, ps.domainPath+"/") {
+			slog.Warn("rejected request outside custom path prefix",
+				"component", "proxy      ",
+				"host", r.Host,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"client_ip", ExtractClientIP(r),
+			)
+			// Stealth rejection: 404 Not Found without response body
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 	}

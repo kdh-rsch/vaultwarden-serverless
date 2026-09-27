@@ -862,6 +862,7 @@ func main() {
 		StartupTimeout: cfg.StartupTimeout,
 		AllowedHosts:   cfg.AllowedHosts,
 		StrictHost:     cfg.StrictHost,
+		DomainPath:     cfg.DomainPath,
 		AuthTokens:     authTokens,
 	})
 	if err != nil {

@@ -409,17 +409,73 @@ func TestReverseProxy_StrictHost(t *testing.T) {
 		}
 	}
 
-	// 3. Disallowed host must be rejected with 403 Forbidden
+	// 3. Disallowed host must be rejected with 404 Not Found without response body
 	for _, badHost := range []string{"malicious-scanner.com", "1.2.3.4", "example.com"} {
 		req := httptest.NewRequest(http.MethodGet, "/api/sync", nil)
 		req.Host = badHost
 		rec := httptest.NewRecorder()
 		ps.ServeHTTP(rec, req)
-		if rec.Code != http.StatusForbidden {
-			t.Errorf("expected disallowed host %q to return 403, got %d", badHost, rec.Code)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("expected disallowed host %q to return 404, got %d", badHost, rec.Code)
 		}
-		if !strings.Contains(rec.Body.String(), "Host header is not allowed") {
-			t.Errorf("expected forbidden message in body, got %s", rec.Body.String())
+		if rec.Body.Len() > 0 {
+			t.Errorf("expected empty body for disallowed host, got %s", rec.Body.String())
+		}
+	}
+}
+
+func TestReverseProxy_CustomPathPrefix(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("backend ok"))
+	}))
+	defer backend.Close()
+
+	ps, err := NewReverseProxyServer(ProxyConfig{
+		ListenAddr:   ":0",
+		TargetURL:    backend.URL,
+		AllowedHosts: []string{"vault.example.com"},
+		StrictHost:   true,
+		DomainPath:   "/nxp42",
+	})
+	if err != nil {
+		t.Fatalf("failed to create reverse proxy: %v", err)
+	}
+	ps.MarkReady()
+
+	// 1. Probes (root and subpath prefixed) should succeed
+	for _, p := range []string{"/ready", "/healthz", "/nxp42/ready", "/nxp42/healthz"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.Host = "127.0.0.1"
+		rec := httptest.NewRecorder()
+		ps.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected probe %s to return 200, got %d", p, rec.Code)
+		}
+	}
+
+	// 2. Request matching custom path prefix should succeed
+	for _, p := range []string{"/nxp42", "/nxp42/", "/nxp42/api/sync"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.Host = "vault.example.com"
+		rec := httptest.NewRecorder()
+		ps.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected path %s to return 200, got %d", p, rec.Code)
+		}
+	}
+
+	// 3. Request outside custom path prefix should be rejected with 404 and empty body
+	for _, p := range []string{"/", "/admin", "/api/sync", "/robots.txt", "/nxp42fake"} {
+		req := httptest.NewRequest(http.MethodGet, p, nil)
+		req.Host = "vault.example.com"
+		rec := httptest.NewRecorder()
+		ps.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("expected path %s outside prefix to return 404, got %d", p, rec.Code)
+		}
+		if rec.Body.Len() > 0 {
+			t.Errorf("expected empty body for path %s, got %s", p, rec.Body.String())
 		}
 	}
 }
