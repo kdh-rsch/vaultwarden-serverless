@@ -63,6 +63,8 @@ func (h *ZerologHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	for _, a := range attrs {
 		if a.Key == "component" {
 			subLogger = subLogger.With().Str("component", padComponent(a.Value.String())).Logger()
+		} else if err, ok := a.Value.Any().(error); ok && err != nil {
+			subLogger = subLogger.With().AnErr(a.Key, err).Logger()
 		} else {
 			subLogger = subLogger.With().Any(a.Key, a.Value.Any()).Logger()
 		}
@@ -107,7 +109,11 @@ func (h *ZerologHandler) Handle(_ context.Context, r slog.Record) error {
 
 	// Add other attributes in order
 	for _, a := range otherAttrs {
-		evt = evt.Any(a.Key, a.Value.Any())
+		if err, ok := a.Value.Any().(error); ok && err != nil {
+			evt = evt.AnErr(a.Key, err)
+		} else {
+			evt = evt.Any(a.Key, a.Value.Any())
+		}
 	}
 
 	// If unparseable stderr string is present, add it

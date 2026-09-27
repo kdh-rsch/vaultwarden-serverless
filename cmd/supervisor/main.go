@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -450,30 +451,80 @@ func stopProcess(cmd *exec.Cmd, done <-chan error, sig os.Signal, timeout time.D
 	}
 }
 
-func waitForBackendAlive(aliveURL string, procDone <-chan error, timeout time.Duration) error {
+type probeStatus struct {
+	statusCode int
+	body       string
+	err        error
+}
+
+func waitForBackendAlive(urls []string, procDone <-chan error, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 500 * time.Millisecond}
+
+	lastStatuses := make(map[string]probeStatus)
+	attempts := 0
+	lastProgressLog := time.Now()
 
 	for {
 		select {
 		case err := <-procDone:
 			if err == nil {
-				return errors.New("backend process exited unexpectedly with status 0")
+				return "", errors.New("backend process exited unexpectedly with status 0")
 			}
-			return fmt.Errorf("backend process exited prematurely: %w", err)
+			return "", fmt.Errorf("backend process exited prematurely: %w", err)
 		default:
 		}
 
-		resp, err := client.Get(aliveURL)
-		if err == nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				return nil
+		attempts++
+		for _, u := range urls {
+			resp, err := client.Get(u)
+			if err != nil {
+				lastStatuses[u] = probeStatus{err: err}
+			} else {
+				bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+				_ = resp.Body.Close()
+				bodyStr := strings.TrimSpace(string(bodyBytes))
+				lastStatuses[u] = probeStatus{statusCode: resp.StatusCode, body: bodyStr}
+
+				if resp.StatusCode == http.StatusOK {
+					return u, nil
+				}
 			}
 		}
 
+		// Log probe progress periodically every 2 seconds
+		if time.Since(lastProgressLog) >= 2*time.Second {
+			lastProgressLog = time.Now()
+			var details []string
+			for _, u := range urls {
+				st := lastStatuses[u]
+				if st.err != nil {
+					details = append(details, fmt.Sprintf("%s (err=%v)", u, st.err))
+				} else {
+					details = append(details, fmt.Sprintf("%s (status=%d, body=%q)", u, st.statusCode, st.body))
+				}
+			}
+			slog.Info("probing Vaultwarden backend readiness",
+				"component", "supervisor",
+				"elapsed", time.Since(deadline.Add(-timeout)).Round(time.Millisecond).String(),
+				"timeout", timeout.String(),
+				"attempts", attempts,
+				"probes", strings.Join(details, " | "),
+			)
+		}
+
 		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %v waiting for %s", timeout, aliveURL)
+			var details []string
+			for _, u := range urls {
+				st := lastStatuses[u]
+				if st.err != nil {
+					details = append(details, fmt.Sprintf("[%s -> err: %v]", u, st.err))
+				} else {
+					details = append(details, fmt.Sprintf("[%s -> status: %d, body: %q]", u, st.statusCode, st.body))
+				}
+			}
+			return "", fmt.Errorf("timed out after %v waiting for backend (attempts=%d): %s",
+				timeout, attempts, strings.Join(details, ", "))
 		}
 
 		time.Sleep(50 * time.Millisecond)
@@ -626,16 +677,38 @@ func runDualProcess(ctx context.Context, cfg *Config, proxy *ReverseProxyServer)
 		vwDone <- vwCmd.Wait()
 	}()
 
-	// Wait for Vaultwarden's internal /alive probe (accounting for DOMAIN subpath if set)
-	probePath := path.Join("/", cfg.DomainPath, "alive")
-	aliveURL := fmt.Sprintf("http://127.0.0.1:%s%s", cfg.InternalPort, probePath)
-	if err := waitForBackendAlive(aliveURL, vwDone, 10*time.Second); err != nil {
-		slog.Error("Vaultwarden failed to become ready", "component", "supervisor", "error", err)
+	// Build candidate alive URLs to probe
+	// 1. If DOMAIN subpath is configured, try subpath URL first (e.g. http://127.0.0.1:8081/nxp42/alive)
+	// 2. Also try root URL (e.g. http://127.0.0.1:8081/alive) in case Vaultwarden serves /alive at root
+	var candidateURLs []string
+	if cfg.DomainPath != "" {
+		probePath := path.Join("/", cfg.DomainPath, "alive")
+		candidateURLs = append(candidateURLs, fmt.Sprintf("http://127.0.0.1:%s%s", cfg.InternalPort, probePath))
+	}
+	rootURL := fmt.Sprintf("http://127.0.0.1:%s/alive", cfg.InternalPort)
+	if len(candidateURLs) == 0 || candidateURLs[0] != rootURL {
+		candidateURLs = append(candidateURLs, rootURL)
+	}
+
+	timeout := cfg.StartupTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	slog.Info("probing Vaultwarden readiness", "component", "supervisor", "candidates", strings.Join(candidateURLs, ", "), "timeout", timeout.String())
+
+	readyURL, err := waitForBackendAlive(candidateURLs, vwDone, timeout)
+	if err != nil {
+		slog.Error("Vaultwarden failed to become ready",
+			"component", "supervisor",
+			"candidates", strings.Join(candidateURLs, ", "),
+			"timeout", timeout.String(),
+			"error", err,
+		)
 		_ = vwCmd.Process.Kill()
 		_ = stopProcess(lsCmd, lsDone, syscall.SIGTERM, 2*time.Second)
 		return 1
 	}
-	slog.Info("Vaultwarden backend is ready on internal port; all services operational", "component", "supervisor", "url", aliveURL)
+	slog.Info("Vaultwarden backend is ready on internal port; all services operational", "component", "supervisor", "url", readyURL)
 	if proxy != nil {
 		proxy.MarkReady()
 	}
