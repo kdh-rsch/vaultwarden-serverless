@@ -454,8 +454,28 @@ func TestReverseProxy_CustomPathPrefix(t *testing.T) {
 		}
 	}
 
-	// 2. Request matching custom path prefix should succeed
-	for _, p := range []string{"/nxp42", "/nxp42/", "/nxp42/api/sync"} {
+	// 2. Request matching custom path prefix without trailing slash should redirect with 301
+	for _, tc := range []struct {
+		path     string
+		expected string
+	}{
+		{"/nxp42", "/nxp42/"},
+		{"/nxp42?param=1", "/nxp42/?param=1"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		req.Host = "vault.example.com"
+		rec := httptest.NewRecorder()
+		ps.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMovedPermanently {
+			t.Errorf("expected bare path %s to return 301, got %d", tc.path, rec.Code)
+		}
+		if loc := rec.Header().Get("Location"); loc != tc.expected {
+			t.Errorf("expected Location header %s, got %s", tc.expected, loc)
+		}
+	}
+
+	// 2.1. Request matching custom path prefix with trailing slash or subpath should succeed
+	for _, p := range []string{"/nxp42/", "/nxp42/api/sync"} {
 		req := httptest.NewRequest(http.MethodGet, p, nil)
 		req.Host = "vault.example.com"
 		rec := httptest.NewRecorder()

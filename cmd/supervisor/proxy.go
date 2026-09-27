@@ -373,7 +373,16 @@ func (ps *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 	// 2.5. Custom Path Prefix Validation: If domainPath is configured, reject requests outside the prefix
 	if ps.domainPath != "" {
-		if r.URL.Path != ps.domainPath && !strings.HasPrefix(r.URL.Path, ps.domainPath+"/") {
+		if r.URL.Path == ps.domainPath {
+			target := ps.domainPath + "/"
+			if r.URL.RawQuery != "" {
+				target += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, target, http.StatusMovedPermanently)
+			return
+		}
+
+		if !strings.HasPrefix(r.URL.Path, ps.domainPath+"/") {
 			slog.Warn("rejected request outside custom path prefix",
 				"component", "proxy      ",
 				"host", r.Host,
