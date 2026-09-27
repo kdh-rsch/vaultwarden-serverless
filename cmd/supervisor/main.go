@@ -38,10 +38,11 @@ type Config struct {
 	SocketPath             string
 	LitestreamBin          string
 	VaultwardenBin         string
-	SyncInterval           string
-	SnapshotInterval       string
-	Retention              string
-	ShutdownTimeoutSeconds time.Duration
+	SyncInterval             string
+	SnapshotInterval         string
+	Retention                string
+	L0RetentionCheckInterval string
+	ShutdownTimeoutSeconds   time.Duration
 	StartupTimeout         time.Duration
 	AllowedHosts           []string
 	StrictHost             bool
@@ -184,10 +185,11 @@ func loadConfig() (*Config, error) {
 		SocketPath:             getEnvOrDefault("LITESTREAM_SOCKET_PATH", "/tmp/litestream.sock"),
 		LitestreamBin:          getEnvOrDefault("LITESTREAM_BIN", "litestream"),
 		VaultwardenBin:         getEnvOrDefault("VAULTWARDEN_BIN", "/vaultwarden"),
-		SyncInterval:           parseDurationOrDefault("SYNC_INTERVAL", "1s"),
-		SnapshotInterval:       parseDurationOrDefault("SNAPSHOT_INTERVAL", "12h"),
-		Retention:              parseDurationOrDefault("RETENTION", "168h"),
-		ShutdownTimeoutSeconds: timeout,
+		SyncInterval:             parseDurationOrDefault("SYNC_INTERVAL", "1s"),
+		SnapshotInterval:         parseDurationOrDefault("SNAPSHOT_INTERVAL", "12h"),
+		Retention:                parseDurationOrDefault("RETENTION", "168h"),
+		L0RetentionCheckInterval: parseDurationOrDefault("L0_RETENTION_CHECK_INTERVAL", "15m"),
+		ShutdownTimeoutSeconds:   timeout,
 		StartupTimeout:         startupTimeout,
 		AllowedHosts:           allowedHosts,
 		StrictHost:             strictHost && len(allowedHosts) > 0,
@@ -317,6 +319,9 @@ func setupRSAKey(ctx context.Context, cfg *Config, s3 *S3Client) error {
 func generateLitestreamConfig(cfg *Config) error {
 	var sb strings.Builder
 	sb.WriteString("# Generated dynamically by vaultwarden-serverless supervisor\n")
+	if cfg.L0RetentionCheckInterval != "" {
+		sb.WriteString(fmt.Sprintf("l0-retention-check-interval: %s\n", cfg.L0RetentionCheckInterval))
+	}
 	sb.WriteString("socket:\n")
 	sb.WriteString("  enabled: true\n")
 	sb.WriteString(fmt.Sprintf("  path: %s\n", cfg.SocketPath))

@@ -59,11 +59,44 @@ func TestLoadConfig_Success(t *testing.T) {
 	if cfg.SnapshotInterval != "12h" {
 		t.Errorf("expected SnapshotInterval=12h, got %s", cfg.SnapshotInterval)
 	}
+	if cfg.Retention != "168h" {
+		t.Errorf("expected Retention=168h, got %s", cfg.Retention)
+	}
+	if cfg.L0RetentionCheckInterval != "15m" {
+		t.Errorf("expected L0RetentionCheckInterval=15m, got %s", cfg.L0RetentionCheckInterval)
+	}
 	if cfg.ShutdownTimeoutSeconds != 10*time.Second {
 		t.Errorf("expected ShutdownTimeout=10s, got %v", cfg.ShutdownTimeoutSeconds)
 	}
 	if cfg.StartupTimeout != 30*time.Second {
 		t.Errorf("expected StartupTimeout=30s, got %v", cfg.StartupTimeout)
+	}
+}
+
+func TestLoadConfig_L0RetentionCheckInterval(t *testing.T) {
+	t.Setenv("REPLICA_BUCKET", "my-bucket")
+	t.Setenv("REPLICA_ENDPOINT", "s3.us-west-004.backblazeb2.com")
+	t.Setenv("LITESTREAM_ACCESS_KEY_ID", "key123")
+	t.Setenv("LITESTREAM_SECRET_ACCESS_KEY", "secret456")
+
+	// Custom valid interval
+	t.Setenv("L0_RETENTION_CHECK_INTERVAL", "30m")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+	if cfg.L0RetentionCheckInterval != "30m" {
+		t.Errorf("expected L0RetentionCheckInterval=30m, got %s", cfg.L0RetentionCheckInterval)
+	}
+
+	// Invalid interval fallback to default 15m
+	t.Setenv("L0_RETENTION_CHECK_INTERVAL", "not-a-valid-duration")
+	cfgInvalid, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+	if cfgInvalid.L0RetentionCheckInterval != "15m" {
+		t.Errorf("expected fallback L0RetentionCheckInterval=15m, got %s", cfgInvalid.L0RetentionCheckInterval)
 	}
 }
 
@@ -232,9 +265,10 @@ func TestGenerateLitestreamConfig(t *testing.T) {
 		DBPath:           filepath.Join(tmpDir, "db.sqlite3"),
 		ConfigPath:       configPath,
 		SocketPath:       socketPath,
-		SyncInterval:     "2s",
-		SnapshotInterval: "6h",
-		Retention:        "72h",
+		SyncInterval:             "2s",
+		SnapshotInterval:         "6h",
+		Retention:                "72h",
+		L0RetentionCheckInterval: "15m",
 	}
 
 	if err := generateLitestreamConfig(cfg); err != nil {
@@ -248,6 +282,7 @@ func TestGenerateLitestreamConfig(t *testing.T) {
 
 	yamlStr := string(content)
 	expectedSubstrings := []string{
+		"l0-retention-check-interval: 15m",
 		"socket:",
 		"enabled: true",
 		"path: " + socketPath,

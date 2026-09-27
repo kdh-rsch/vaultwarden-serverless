@@ -141,6 +141,7 @@ gcloud run services update-traffic vaultwarden \
 | `SYNC_INTERVAL` | `1s` | Interval between Litestream WAL replication checks. |
 | `SNAPSHOT_INTERVAL` | `12h` | Interval between full database snapshot uploads. |
 | `RETENTION` | `168h` (7 days) | Point-in-time recovery (PITR) retention window. |
+| `L0_RETENTION_CHECK_INTERVAL` | `15m` | Interval for Litestream to check and purge compacted L0 files. Set to 15m to avoid excessive S3/B2 `ListObjectsV2` calls (Class C limit protection). |
 | `STARTUP_TIMEOUT` | `30s` | Maximum duration the reverse proxy buffers incoming requests while waiting for Vaultwarden to initialize during cold starts. |
 | `SHUTDOWN_TIMEOUT` | `10s` | Maximum grace period for graceful teardown (Vaultwarden drain + explicit sync + daemon shutdown). |
 | `STRICT_HOST` | `false` | When `true`, enforces strict Host header matching against `DOMAIN` (blocks raw IP / Shodan scanner requests with 403). |
