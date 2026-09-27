@@ -1,0 +1,179 @@
+name: Build and Publish Container Image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  schedule:
+    # Check every 12 hours (at 00:00 and 12:00 UTC)
+    - cron: '0 0,12 * * *'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  check-upstream:
+    name: Check Upstream Releases
+    runs-on: ubuntu-latest
+    outputs:
+      needs_build: ${{ steps.decide.outputs.needs_build }}
+      litestream_version: ${{ steps.inspect.outputs.litestream_version }}
+      vw_digest: ${{ steps.inspect.outputs.vw_digest }}
+      go_ver: ${{ steps.inspect.outputs.go_ver }}
+      fingerprint: ${{ steps.inspect.outputs.fingerprint }}
+
+    steps:
+      - name: Inspect Upstream Versions
+        id: inspect
+        run: |
+          # 1. Fetch latest Vaultwarden Docker Hub digest
+          VW_TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:vaultwarden/server:pull" | jq -r .token)
+          VW_DIGEST=$(curl -s -I -H "Authorization: Bearer $VW_TOKEN" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "https://registry-1.docker.io/v2/vaultwarden/server/manifests/latest" | grep -i "docker-content-digest:" | awk '{print $2}' | tr -d '\r\n')
+          echo "Vaultwarden latest digest: ${VW_DIGEST}"
+          echo "vw_digest=${VW_DIGEST}" >> "$GITHUB_OUTPUT"
+
+          # 2. Fetch latest Litestream GitHub release tag
+          LS_TAG=$(curl -s https://api.github.com/repos/benbjohnson/litestream/releases/latest | jq -r .tag_name | sed 's/^v//')
+          if [ -z "$LS_TAG" ] || [ "$LS_TAG" = "null" ]; then
+            LS_TAG="0.5.17"
+          fi
+          echo "Litestream latest version: ${LS_TAG}"
+          echo "litestream_version=${LS_TAG}" >> "$GITHUB_OUTPUT"
+
+          # 3. Fetch latest stable Go version
+          GO_VER=$(curl -s "https://go.dev/dl/?mode=json" | jq -r '.[0].version')
+          echo "Go stable version: ${GO_VER}"
+          echo "go_ver=${GO_VER}" >> "$GITHUB_OUTPUT"
+
+          # 4. Generate combined upstream fingerprint
+          FP=$(echo -n "${VW_DIGEST}|ls:${LS_TAG}|go:${GO_VER}" | sha256sum | cut -d' ' -f1)
+          echo "Upstream Fingerprint: ${FP}"
+          echo "fingerprint=${FP}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Upstream Fingerprint Cache
+        if: github.event_name == 'schedule'
+        id: cache-check
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/upstream-fingerprint.txt
+          key: upstream-fp-${{ steps.inspect.outputs.fingerprint }}
+
+      - name: Decide if build should proceed
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Push or manual trigger -> Proceeding with build."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "${{ steps.cache-check.outputs.cache-hit }}" == "true" ]; then
+            echo "No upstream updates detected across Vaultwarden, Litestream, or Go. Skipping build."
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream change detected! Triggering automated rebuild."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    name: Run Unit Tests
+    needs: check-upstream
+    if: needs.check-upstream.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go (Latest Stable)
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Run Go Unit Tests
+        run: go test -v ./...
+
+      - name: Verify CGO-Free Static Compilation
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /tmp/supervisor-amd64 ./cmd/supervisor
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o /tmp/supervisor-arm64 ./cmd/supervisor
+          file /tmp/supervisor-amd64 | grep "statically linked"
+          file /tmp/supervisor-arm64 | grep "statically linked"
+
+  build-and-push:
+    name: Build & Publish Container (GHCR)
+    needs: [check-upstream, test]
+    if: needs.check-upstream.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=short,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=schedule,pattern=update-{{date 'YYYYMMDD-HHmmss'}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            LITESTREAM_VERSION=${{ needs.check-upstream.outputs.litestream_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish GitHub Release (Pure Python, High-Assurance)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref }}
+          LITESTREAM_VERSION: ${{ needs.check-upstream.outputs.litestream_version }}
+          VAULTWARDEN_DIGEST: ${{ needs.check-upstream.outputs.vw_digest }}
+          GO_VERSION: ${{ needs.check-upstream.outputs.go_ver }}
+          UPSTREAM_FINGERPRINT: ${{ needs.check-upstream.outputs.fingerprint }}
+        run: |
+          python3 .github/scripts/create_release.py
+
+      - name: Prepare Upstream Fingerprint File
+        if: github.event_name == 'schedule'
+        run: |
+          mkdir -p /tmp
+          echo "${{ needs.check-upstream.outputs.fingerprint }}" > /tmp/upstream-fingerprint.txt
+
+      - name: Save Upstream Fingerprint Cache
+        if: github.event_name == 'schedule'
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/upstream-fingerprint.txt
+          key: upstream-fp-${{ needs.check-upstream.outputs.fingerprint }}
