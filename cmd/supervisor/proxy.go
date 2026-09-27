@@ -18,14 +18,16 @@ import (
 
 // ProxyConfig contains settings for the embedded reverse proxy.
 type ProxyConfig struct {
-	ListenAddr     string        // e.g. ":8080"
-	TargetURL      string        // e.g. "http://127.0.0.1:8081"
-	ProjectID      string        // GCP Project ID for Cloud Trace correlation
-	StartupTimeout time.Duration // Timeout for buffering client requests during boot
-	AllowedHosts   []string      // Allowed Host header values (case-insensitive)
-	StrictHost     bool          // Whether to enforce AllowedHosts validation
-	DomainPath     string        // URL subpath prefix (e.g. "/nxp42")
-	AuthTokens     []string      // Allowed secret tokens for administrative endpoints (e.g. /_supervisor/taint)
+	ListenAddr            string        // e.g. ":8080"
+	TargetURL             string        // e.g. "http://127.0.0.1:8081"
+	ProjectID             string        // GCP Project ID for Cloud Trace correlation
+	StartupTimeout        time.Duration // Timeout for buffering client requests during boot
+	AllowedHosts          []string      // Allowed Host header values (case-insensitive)
+	StrictHost            bool          // Whether to enforce AllowedHosts validation
+	DomainPath            string        // URL subpath prefix (e.g. "/nxp42")
+	AuthTokens            []string      // Allowed secret tokens for administrative endpoints (e.g. /_supervisor/taint)
+	WebsocketEnabled      bool          // Whether WebSocket/real-time notifications are enabled
+	WebsocketDisabledCode int           // HTTP status code to return when WebSocket/long-polling is rejected (default 404)
 }
 
 // statusRecorder captures the HTTP response status code and written byte count,
@@ -85,9 +87,11 @@ type ReverseProxyServer struct {
 	projectID      string
 	startupTimeout time.Duration
 	allowedHosts   []string
-	strictHost     bool
-	domainPath     string
-	authTokens     []string
+	strictHost            bool
+	domainPath            string
+	authTokens            []string
+	websocketEnabled      bool
+	websocketDisabledCode int
 }
 
 // NewReverseProxyServer constructs a ReverseProxyServer.
@@ -116,15 +120,22 @@ func NewReverseProxyServer(cfg ProxyConfig) (*ReverseProxyServer, error) {
 		}
 	}
 
+	wsDisabledCode := cfg.WebsocketDisabledCode
+	if wsDisabledCode < 400 || wsDisabledCode >= 600 {
+		wsDisabledCode = http.StatusNotFound
+	}
+
 	ps := &ReverseProxyServer{
-		targetURL:      target,
-		readyCh:        make(chan struct{}),
-		projectID:      strings.TrimSpace(cfg.ProjectID),
-		startupTimeout: startupTimeout,
-		allowedHosts:   allowedHosts,
-		strictHost:     cfg.StrictHost && len(allowedHosts) > 0,
-		domainPath:     strings.TrimRight(cfg.DomainPath, "/"),
-		authTokens:     authTokens,
+		targetURL:             target,
+		readyCh:               make(chan struct{}),
+		projectID:             strings.TrimSpace(cfg.ProjectID),
+		startupTimeout:        startupTimeout,
+		allowedHosts:          allowedHosts,
+		strictHost:            cfg.StrictHost && len(allowedHosts) > 0,
+		domainPath:            strings.TrimRight(cfg.DomainPath, "/"),
+		authTokens:            authTokens,
+		websocketEnabled:      cfg.WebsocketEnabled,
+		websocketDisabledCode: wsDisabledCode,
 	}
 
 	rp := &httputil.ReverseProxy{
@@ -392,6 +403,39 @@ func (ps *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 			)
 			// Stealth rejection: 404 Not Found without response body
 			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}
+
+	// 2.7. Block WebSocket and Long-Polling if WebSockets are disabled
+	if !ps.websocketEnabled {
+		isWS := isWebSocketRequest(r)
+		isNotif := isNotificationPath(probePath)
+
+		if isWS || isNotif {
+			slog.Warn("rejected disabled websocket/long-polling request",
+				"component", "proxy      ",
+				"host", r.Host,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"norm_path", probePath,
+				"is_websocket", isWS,
+				"is_notification", isNotif,
+				"client_ip", ExtractClientIP(r),
+			)
+
+			code := ps.websocketDisabledCode
+			if isWS && !isNotif && code == http.StatusNotFound {
+				code = http.StatusBadRequest
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Connection", "close")
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   "websocket_disabled",
+				"message": "WebSocket and long-polling notifications are disabled on this server",
+			})
 			return
 		}
 	}
@@ -736,4 +780,32 @@ func (ps *ReverseProxyServer) handleSync(w http.ResponseWriter, r *http.Request)
 	}
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// isWebSocketRequest checks if the incoming HTTP request is attempting a WebSocket upgrade.
+func isWebSocketRequest(r *http.Request) bool {
+	if headerContainsToken(r.Header.Get("Upgrade"), "websocket") {
+		return true
+	}
+	if headerContainsToken(r.Header.Get("Connection"), "upgrade") && r.Header.Get("Sec-WebSocket-Key") != "" {
+		return true
+	}
+	return false
+}
+
+// headerContainsToken checks if a comma-delimited header value contains a specific token (case-insensitive).
+func headerContainsToken(headerValue, token string) bool {
+	for _, part := range strings.Split(headerValue, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), token) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNotificationPath checks if the normalized path corresponds to Vaultwarden real-time notification endpoints
+// (WebSockets, SignalR hubs, negotiation, or long-polling).
+func isNotificationPath(path string) bool {
+	clean := strings.TrimRight(path, "/")
+	return clean == "/notifications" || strings.HasPrefix(path, "/notifications/")
 }

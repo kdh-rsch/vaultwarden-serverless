@@ -734,5 +734,261 @@ func TestReverseProxy_SyncEndpoint(t *testing.T) {
 	}
 }
 
+func TestReverseProxy_BlockWebSocketAndLongPollingWhenDisabled(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"backend":"ok"}`))
+	}))
+	defer backend.Close()
+
+	ps, err := NewReverseProxyServer(ProxyConfig{
+		ListenAddr:       ":0",
+		TargetURL:        backend.URL,
+		WebsocketEnabled: false, // Explicitly disabled
+	})
+	if err != nil {
+		t.Fatalf("failed to create reverse proxy: %v", err)
+	}
+	ps.MarkReady()
+
+	tests := []struct {
+		name           string
+		method         string
+		path           string
+		headers        map[string]string
+		expectCode     int
+		expectBlocked  bool
+		expectErrField string
+	}{
+		{
+			name:   "WebSocket upgrade to /notifications/hub",
+			method: http.MethodGet,
+			path:   "/notifications/hub",
+			headers: map[string]string{
+				"Upgrade":               "websocket",
+				"Connection":            "Upgrade",
+				"Sec-WebSocket-Key":     "dGhlIHNhbXBsZSBub25jZQ==",
+				"Sec-WebSocket-Version": "13",
+			},
+			expectCode:     http.StatusNotFound,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:           "SignalR negotiate endpoint",
+			method:         http.MethodPost,
+			path:           "/notifications/hub/negotiate?negotiateVersion=1",
+			expectCode:     http.StatusNotFound,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:           "SignalR long polling poll GET",
+			method:         http.MethodGet,
+			path:           "/notifications/hub?id=test-conn-id",
+			expectCode:     http.StatusNotFound,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:           "SignalR long polling send POST",
+			method:         http.MethodPost,
+			path:           "/notifications/hub?id=test-conn-id",
+			expectCode:     http.StatusNotFound,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:           "SignalR long polling abort DELETE",
+			method:         http.MethodDelete,
+			path:           "/notifications/hub?id=test-conn-id",
+			expectCode:     http.StatusNotFound,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:           "Anonymous hub negotiate",
+			method:         http.MethodPost,
+			path:           "/notifications/anonymous-hub/negotiate",
+			expectCode:     http.StatusNotFound,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:   "Anonymous hub websocket upgrade",
+			method: http.MethodGet,
+			path:   "/notifications/anonymous-hub",
+			headers: map[string]string{
+				"Upgrade":    "websocket",
+				"Connection": "Upgrade",
+			},
+			expectCode:     http.StatusNotFound,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:   "WebSocket upgrade on non-notification route",
+			method: http.MethodGet,
+			path:   "/api/custom-ws",
+			headers: map[string]string{
+				"Upgrade":    "websocket",
+				"Connection": "Upgrade",
+			},
+			expectCode:     http.StatusBadRequest,
+			expectBlocked:  true,
+			expectErrField: "websocket_disabled",
+		},
+		{
+			name:          "Regular HTTP sync request should not be blocked",
+			method:        http.MethodGet,
+			path:          "/api/sync",
+			expectCode:    http.StatusOK,
+			expectBlocked: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+
+			ps.ServeHTTP(rec, req)
+
+			if rec.Code != tc.expectCode {
+				t.Errorf("expected status %d, got %d (body: %s)", tc.expectCode, rec.Code, rec.Body.String())
+			}
+
+			if tc.expectBlocked {
+				if connHeader := rec.Header().Get("Connection"); connHeader != "close" {
+					t.Errorf("expected Connection: close header on blocked request, got %q", connHeader)
+				}
+				if !strings.Contains(rec.Body.String(), tc.expectErrField) {
+					t.Errorf("expected body to contain %q, got %s", tc.expectErrField, rec.Body.String())
+				}
+			} else {
+				if !strings.Contains(rec.Body.String(), `"backend":"ok"`) {
+					t.Errorf("expected backend response, got %s", rec.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestReverseProxy_BlockWebSocketWithCustomDomainPath(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"backend":"ok"}`))
+	}))
+	defer backend.Close()
+
+	ps, err := NewReverseProxyServer(ProxyConfig{
+		ListenAddr:       ":0",
+		TargetURL:        backend.URL,
+		DomainPath:       "/nxp42",
+		WebsocketEnabled: false,
+	})
+	if err != nil {
+		t.Fatalf("failed to create reverse proxy: %v", err)
+	}
+	ps.MarkReady()
+
+	// 1. WebSocket upgrade under subpath -> 404
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/nxp42/notifications/hub", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	ps.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for subpath websocket, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "websocket_disabled") {
+		t.Errorf("expected websocket_disabled in body, got %s", rec.Body.String())
+	}
+
+	// 2. Negotiate under subpath -> 404
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/nxp42/notifications/hub/negotiate", nil)
+	ps.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for subpath negotiate, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	// 3. Normal API request under subpath -> 200 OK forwarded to backend
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/nxp42/api/sync", nil)
+	ps.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for regular request, got %d", rec.Code)
+	}
+}
+
+func TestReverseProxy_AllowWebSocketWhenEnabled(t *testing.T) {
+	backendCalled := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendCalled = true
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"backend":"forwarded"}`))
+	}))
+	defer backend.Close()
+
+	ps, err := NewReverseProxyServer(ProxyConfig{
+		ListenAddr:       ":0",
+		TargetURL:        backend.URL,
+		WebsocketEnabled: true, // WebSockets enabled
+	})
+	if err != nil {
+		t.Fatalf("failed to create reverse proxy: %v", err)
+	}
+	ps.MarkReady()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/notifications/hub/negotiate", nil)
+	ps.ServeHTTP(rec, req)
+
+	if !backendCalled {
+		t.Errorf("expected backend to be called when WebsocketEnabled is true")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK forwarded from backend, got %d", rec.Code)
+	}
+}
+
+func TestReverseProxy_CustomDisabledStatusCode(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	ps, err := NewReverseProxyServer(ProxyConfig{
+		ListenAddr:            ":0",
+		TargetURL:             backend.URL,
+		WebsocketEnabled:      false,
+		WebsocketDisabledCode: http.StatusForbidden, // 403 Forbidden
+	})
+	if err != nil {
+		t.Fatalf("failed to create reverse proxy: %v", err)
+	}
+	ps.MarkReady()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/notifications/hub", nil)
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	ps.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected configured 403 Forbidden, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "websocket_disabled") {
+		t.Errorf("expected body to contain websocket_disabled, got %s", rec.Body.String())
+	}
+}
+
 
 

@@ -94,6 +94,77 @@ func TestLoadConfig_StartupTimeout(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_WebsocketOptions(t *testing.T) {
+	t.Setenv("REPLICA_BUCKET", "my-bucket")
+	t.Setenv("REPLICA_ENDPOINT", "s3.us-west-004.backblazeb2.com")
+	t.Setenv("LITESTREAM_ACCESS_KEY_ID", "key123")
+	t.Setenv("LITESTREAM_SECRET_ACCESS_KEY", "secret456")
+
+	// 1. Default (unset) -> WebsocketEnabled=false, WebsocketDisabledCode=404
+	t.Setenv("WEBSOCKET_ENABLED", "")
+	t.Setenv("WEBSOCKET_DISABLED_STATUS_CODE", "")
+	cfgDefault, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+	if cfgDefault.WebsocketEnabled {
+		t.Errorf("expected WebsocketEnabled=false by default, got true")
+	}
+	if cfgDefault.WebsocketDisabledCode != http.StatusNotFound {
+		t.Errorf("expected WebsocketDisabledCode=404 by default, got %d", cfgDefault.WebsocketDisabledCode)
+	}
+
+	// 2. Explicitly enabled with "true"
+	t.Setenv("WEBSOCKET_ENABLED", "true")
+	cfgTrue, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfgTrue.WebsocketEnabled {
+		t.Errorf("expected WebsocketEnabled=true, got false")
+	}
+
+	// 3. Explicitly enabled with "1"
+	t.Setenv("WEBSOCKET_ENABLED", "1")
+	cfgOne, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfgOne.WebsocketEnabled {
+		t.Errorf("expected WebsocketEnabled=true for '1', got false")
+	}
+
+	// 4. Explicitly disabled with "false"
+	t.Setenv("WEBSOCKET_ENABLED", "false")
+	cfgFalse, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfgFalse.WebsocketEnabled {
+		t.Errorf("expected WebsocketEnabled=false, got true")
+	}
+
+	// 5. Custom status code (403 Forbidden)
+	t.Setenv("WEBSOCKET_DISABLED_STATUS_CODE", "403")
+	cfg403, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg403.WebsocketDisabledCode != http.StatusForbidden {
+		t.Errorf("expected WebsocketDisabledCode=403, got %d", cfg403.WebsocketDisabledCode)
+	}
+
+	// 6. Invalid status code fallback to 404
+	t.Setenv("WEBSOCKET_DISABLED_STATUS_CODE", "not-a-number")
+	cfgInvalid, err := loadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfgInvalid.WebsocketDisabledCode != http.StatusNotFound {
+		t.Errorf("expected fallback WebsocketDisabledCode=404, got %d", cfgInvalid.WebsocketDisabledCode)
+	}
+}
+
 func TestLoadConfig_StrictHost(t *testing.T) {
 	t.Setenv("REPLICA_BUCKET", "my-bucket")
 	t.Setenv("REPLICA_ENDPOINT", "s3.us-west-004.backblazeb2.com")
@@ -467,7 +538,7 @@ func TestRunDualProcess_SignalHandling(t *testing.T) {
 		VaultwardenBin:         mockVW,
 		PublicPort:             "8094",
 		InternalPort:           mockPort,
-		ShutdownTimeoutSeconds: 3 * time.Second,
+		ShutdownTimeoutSeconds: 10 * time.Second,
 	}
 
 	proxyServer, _ := NewReverseProxyServer(ProxyConfig{
@@ -478,8 +549,13 @@ func TestRunDualProcess_SignalHandling(t *testing.T) {
 	defer proxyServer.Shutdown(context.Background())
 
 	go func() {
-		// Wait for both processes to be active and then trigger SIGTERM
-		time.Sleep(200 * time.Millisecond)
+		// Wait for both processes to be operational (proxy marked ready)
+		for i := 0; i < 100; i++ {
+			if proxyServer.IsReady() {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 		_ = syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
 	}()
 

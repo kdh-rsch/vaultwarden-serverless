@@ -49,6 +49,8 @@ type Config struct {
 	PublicPort             string
 	InternalPort           string
 	ProjectID              string
+	WebsocketEnabled       bool
+	WebsocketDisabledCode  int
 }
 
 // SyncResult represents the machine-readable JSON output of 'litestream sync -json'.
@@ -157,6 +159,16 @@ func loadConfig() (*Config, error) {
 		}
 	}
 
+	wsEnabledStr := strings.ToLower(strings.TrimSpace(os.Getenv("WEBSOCKET_ENABLED")))
+	websocketEnabled := wsEnabledStr == "true" || wsEnabledStr == "1"
+
+	wsDisabledCode := http.StatusNotFound
+	if codeStr := strings.TrimSpace(os.Getenv("WEBSOCKET_DISABLED_STATUS_CODE")); codeStr != "" {
+		if code, err := strconv.Atoi(codeStr); err == nil && code >= 400 && code < 600 {
+			wsDisabledCode = code
+		}
+	}
+
 	return &Config{
 		ReplicaBucket:          bucket,
 		ReplicaEndpoint:        endpoint,
@@ -182,6 +194,8 @@ func loadConfig() (*Config, error) {
 		DomainPath:             domainPath,
 		PublicPort:             getEnvOrDefault("PORT", "8080"),
 		InternalPort:           getEnvOrDefault("INTERNAL_PORT", "8081"),
+		WebsocketEnabled:       websocketEnabled,
+		WebsocketDisabledCode:  wsDisabledCode,
 		ProjectID: func() string {
 			for _, k := range []string{"GCP_PROJECT", "GOOGLE_CLOUD_PROJECT", "PROJECT_ID"} {
 				if v := strings.TrimSpace(os.Getenv(k)); v != "" {
@@ -856,14 +870,16 @@ func main() {
 
 	// Start Reverse Proxy server immediately on public port so Cloud Run gets 200 OK for probes
 	proxyServer, err := NewReverseProxyServer(ProxyConfig{
-		ListenAddr:     fmt.Sprintf(":%s", cfg.PublicPort),
-		TargetURL:      fmt.Sprintf("http://127.0.0.1:%s", cfg.InternalPort),
-		ProjectID:      cfg.ProjectID,
-		StartupTimeout: cfg.StartupTimeout,
-		AllowedHosts:   cfg.AllowedHosts,
-		StrictHost:     cfg.StrictHost,
-		DomainPath:     cfg.DomainPath,
-		AuthTokens:     authTokens,
+		ListenAddr:            fmt.Sprintf(":%s", cfg.PublicPort),
+		TargetURL:             fmt.Sprintf("http://127.0.0.1:%s", cfg.InternalPort),
+		ProjectID:             cfg.ProjectID,
+		StartupTimeout:        cfg.StartupTimeout,
+		AllowedHosts:          cfg.AllowedHosts,
+		StrictHost:            cfg.StrictHost,
+		DomainPath:            cfg.DomainPath,
+		AuthTokens:            authTokens,
+		WebsocketEnabled:      cfg.WebsocketEnabled,
+		WebsocketDisabledCode: cfg.WebsocketDisabledCode,
 	})
 	if err != nil {
 		slog.Error("failed to create reverse proxy", "component", "supervisor", "error", err)

@@ -155,8 +155,8 @@ gcloud run services update-traffic vaultwarden \
 | `SIGNUPS_ALLOWED` | `true` | Allows new user registration. Set to `false` after initial setup. |
 | `INVITATIONS_ALLOWED` | `true` | Allows inviting users even when signups are disabled. |
 | `SHOW_PASSWORD_HINT` | `false` | Shows master password hint on login page. |
-| `ADMIN_TOKEN` | `""` | Access token for the `/admin` portal. **Recommended:** Argon2 PHC string (generated via `docker run --rm -it vaultwarden/server:latest /vaultwarden hash`). See [Operations Guide](docs/OPERATIONS.md#9-admin-token-security--argon2-phc-hashes). |
-| `WEBSOCKET_ENABLED` | `false` | Keep `false` on serverless. WebSockets prevent scale-to-zero. |
+| `WEBSOCKET_ENABLED` | `false` | Keep `false` on serverless. When disabled, the embedded reverse proxy immediately blocks WebSocket upgrade and Long-Polling requests (preventing 60s client hangs and keeping scale-to-zero operational). |
+| `WEBSOCKET_DISABLED_STATUS_CODE` | `404` | HTTP status code returned when WebSocket or long-polling requests are blocked while WebSockets are disabled (e.g. `404`, `400`, `403`). |
 
 ### Real-Time Push Notifications (Serverless-Friendly Sync)
 

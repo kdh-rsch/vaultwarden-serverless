@@ -23,8 +23,16 @@ This guide covers production operations, disaster recovery, real-time push notif
 
 ## 1. Real-Time Push Notifications
 
-### The Problem with WebSockets on Serverless
+### The Problem with WebSockets & Long-Polling on Serverless
 In standard Vaultwarden deployments, live sync between browser extensions and mobile apps relies on persistent WebSockets (`WEBSOCKET_ENABLED=true`). On Google Cloud Run, persistent WebSocket connections keep the container permanently active, which prevents scale-to-zero and incurs continuous CPU billing.
+
+Furthermore, official Bitwarden browser extensions (e.g. Chrome Extension) may ignore the server's disabled WebSocket status and persistently attempt connections to `/notifications/hub` or fall back to SignalR Long-Polling (`/notifications/hub/negotiate`). Without fast rejection at the edge, these pending requests can hang for up to 60 seconds per attempt, keeping the container awake and consuming CPU cycles.
+
+### Reverse Proxy Fast-Fail Mitigation (Automatic)
+When `WEBSOCKET_ENABLED=false` (the default in this serverless architecture), the embedded Go reverse proxy intercepts all WebSocket upgrade requests and SignalR notification/long-polling endpoints (`/notifications/hub`, `/notifications/hub/negotiate`, `/notifications/anonymous-hub`) **before** backend routing or in-flight tracking.
+
+- **Immediate Fast Fail (0ms):** Returns `404 Not Found` (or a customized code via `WEBSOCKET_DISABLED_STATUS_CODE`, e.g. `400` or `403`) with `Connection: close` and a structured JSON payload `{"error":"websocket_disabled",...}`.
+- **Zero Resource Waste:** The client connection terminates immediately, completely preventing 60-second timeouts and allowing Cloud Run to scale to zero as expected.
 
 ### The Solution: Bitwarden Push Relay
 Vaultwarden natively supports the official Bitwarden Push Notification service. When you create, edit, or delete an item in your vault:
