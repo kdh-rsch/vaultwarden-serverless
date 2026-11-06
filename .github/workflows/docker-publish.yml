@@ -22,6 +22,7 @@ jobs:
     outputs:
       needs_build: ${{ steps.decide.outputs.needs_build }}
       litestream_version: ${{ steps.inspect.outputs.litestream_version }}
+      vw_version: ${{ steps.inspect.outputs.vw_version }}
       vw_digest: ${{ steps.inspect.outputs.vw_digest }}
       go_ver: ${{ steps.inspect.outputs.go_ver }}
       fingerprint: ${{ steps.inspect.outputs.fingerprint }}
@@ -29,15 +30,24 @@ jobs:
     steps:
       - name: Inspect Upstream Versions
         id: inspect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Fetch latest Vaultwarden Docker Hub digest
+          # 1. Fetch latest Vaultwarden Docker Hub digest & GitHub release version
           VW_TOKEN=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:vaultwarden/server:pull" | jq -r .token)
           VW_DIGEST=$(curl -s -I -H "Authorization: Bearer $VW_TOKEN" -H "Accept: application/vnd.docker.distribution.manifest.v2+json" "https://registry-1.docker.io/v2/vaultwarden/server/manifests/latest" | grep -i "docker-content-digest:" | awk '{print $2}' | tr -d '\r\n')
           echo "Vaultwarden latest digest: ${VW_DIGEST}"
           echo "vw_digest=${VW_DIGEST}" >> "$GITHUB_OUTPUT"
 
+          VW_VER=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/dani-garcia/vaultwarden/releases/latest | jq -r .tag_name | sed 's/^v//')
+          if [ "$VW_VER" = "null" ]; then
+            VW_VER=""
+          fi
+          echo "Vaultwarden latest version: ${VW_VER}"
+          echo "vw_version=${VW_VER}" >> "$GITHUB_OUTPUT"
+
           # 2. Fetch latest Litestream GitHub release tag
-          LS_TAG=$(curl -s https://api.github.com/repos/benbjohnson/litestream/releases/latest | jq -r .tag_name | sed 's/^v//')
+          LS_TAG=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/benbjohnson/litestream/releases/latest | jq -r .tag_name | sed 's/^v//')
           if [ -z "$LS_TAG" ] || [ "$LS_TAG" = "null" ]; then
             LS_TAG="0.5.17"
           fi
@@ -94,6 +104,9 @@ jobs:
       - name: Run Go Unit Tests
         run: go test -v ./...
 
+      - name: Run Release Script Unit Tests
+        run: python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
+
       - name: Verify CGO-Free Static Compilation
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /tmp/supervisor-amd64 ./cmd/supervisor
@@ -127,6 +140,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Resolve Release Tag
+        id: release-tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="update-$(date -u +%Y%m%d-%H%M%S)"
+          fi
+          echo "Resolved release tag: ${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -134,10 +158,10 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.release-tag.outputs.tag }}
             type=sha,format=short,prefix=sha-
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=schedule,pattern=update-{{date 'YYYYMMDD-HHmmss'}}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -158,7 +182,9 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_REF: ${{ github.ref }}
+          TAG_NAME: ${{ steps.release-tag.outputs.tag }}
           LITESTREAM_VERSION: ${{ needs.check-upstream.outputs.litestream_version }}
+          VAULTWARDEN_VERSION: ${{ needs.check-upstream.outputs.vw_version }}
           VAULTWARDEN_DIGEST: ${{ needs.check-upstream.outputs.vw_digest }}
           GO_VERSION: ${{ needs.check-upstream.outputs.go_ver }}
           UPSTREAM_FINGERPRINT: ${{ needs.check-upstream.outputs.fingerprint }}
